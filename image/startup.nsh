@@ -1,0 +1,2 @@
+LockDown.efi
+reset -s

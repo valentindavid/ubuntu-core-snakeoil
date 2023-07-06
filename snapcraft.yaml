@@ -1,0 +1,110 @@
+name: ubuntu-core-snakeoil
+version: '0.1'
+summary: Snakeoil keys for development versions of Ubuntu Core
+description: |
+  Snakeoil keys for development versions of Ubuntu Core
+base: core22
+confinement: strict
+type: app
+grade: devel
+
+parts:
+  ovmf:
+    plugin: nil
+    build-packages:
+      - ovmf
+    override-build: |
+      install -Dm644 -t "${CRAFT_PART_INSTALL}/ovmf" /usr/share/OVMF/OVMF_CODE{.secboot,}.fd
+      install -Dm644 -t "${CRAFT_PART_INSTALL}/ovmf" /usr/share/OVMF/OVMF_VARS.fd
+
+  snakeoil:
+    plugin: nil
+    source-type: local
+    source: ./keys
+    override-build: |
+      install -Dm644 -t "${CRAFT_PART_INSTALL}/keys" PkKek-1-snakeoil.{key,pem}
+
+  efitools:
+    plugin: nil
+    after:
+      - snakeoil
+    build-packages:
+      - gnu-efi
+      - libfile-slurp-perl
+      - sbsigntool
+      - libssl-dev
+      - openssl
+      - help2man
+      - gcc
+      - make
+      - libc6-dev
+    source-type: git
+    source: https://git.launchpad.net/ubuntu/+source/efitools
+    source-tag: applied/1.9.2-1ubuntu3
+    override-build: |
+      for key in PK KEK DB; do
+        cp "${CRAFT_STAGE}/keys/PkKek-1-snakeoil.key" "${CRAFT_PART_BUILD}/${key}.key"
+        cp "${CRAFT_STAGE}/keys/PkKek-1-snakeoil.pem" "${CRAFT_PART_BUILD}/${key}.crt"
+      done
+
+      make EXTRAKEYS= EXTERNALKEYS=
+
+      install -Dm644 -t "${CRAFT_PART_INSTALL}/efitools" LockDown.efi
+      install -Dm644 -t "${CRAFT_PART_INSTALL}/signed-keys" {DB,KEK,PK,noPK}.{esl,auth}
+    prime:
+      - -efitools
+
+  boot-image:
+    after:
+      - efitools
+    build-packages:
+      - dosfstools
+      - mtools
+      - fdisk
+    plugin: nil
+    source-type: local
+    source: ./image
+    override-build: |
+      truncate --size $((34816*512)) boot.img
+      mkfs.vfat boot.img
+      mcopy -i boot.img startup.nsh '::'
+      mcopy -i boot.img "${CRAFT_STAGE}/efitools/LockDown.efi" '::'
+      truncate --size $((40960*512)) gpt.img
+      sfdisk gpt.img <<EOF
+      label: gpt
+      unit: sectors
+      first-lba: 2048
+      last-lba: 40926
+      sector-size: 512
+
+      gpt.img1 : start=2048, size=36864, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+      EOF
+      dd if=boot.img of=gpt.img seek=2048
+      install -Dm644 -t "${CRAFT_PART_INSTALL}/image" gpt.img
+
+    prime:
+      - -image
+
+  ovmf-with-keys:
+    after:
+      - ovmf
+      - boot-image
+    build-packages:
+      - qemu-system
+      - swtpm
+    build-environment:
+      - to amd64:
+        - QEMU_ARCH: x86_64
+        - QEMU_MACHINE: q35
+    plugin: nil
+    override-build: |
+      cp "${CRAFT_STAGE}/ovmf/OVMF_VARS.fd" OVMF_VARS.snakeoil.fd
+      "qemu-system-${QEMU_ARCH}" \
+        -M "${QEMU_MACHINE}" -m 2G \
+        -global ICH9-LPC.disable_s3=1 \
+        -nographic \
+        -nic none \
+        -drive "if=pflash,file=${CRAFT_STAGE}/ovmf/OVMF_CODE.secboot.fd,readonly=on,format=raw" \
+        -drive "if=pflash,file=OVMF_VARS.snakeoil.fd,format=raw" \
+        -drive "if=virtio,file=${CRAFT_STAGE}/image/gpt.img,readonly=on,format=raw" </dev/null
+      install -Dm644 -t "${CRAFT_PART_INSTALL}/ovmf" OVMF_VARS.snakeoil.fd
